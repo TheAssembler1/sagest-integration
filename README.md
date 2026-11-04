@@ -1,195 +1,109 @@
-# Ensemble campaign orchestrator
+# Minimal Flux ensemble wrapper
 
-Runs an ensemble of N members, one Flux job each, then a post-analysis job, then the next
-ensemble. Failed members are retried or reconfigured, and the analysis starts only after
-all N succeed. It uses only the Python standard library.
+`campaign.py` runs N ensemble members (one Flux job each), then a post-analysis job once all
+N have succeeded, and repeats for a set number of cycles.
 
-```
-flux batch allocation
-└── driver (bin/orchestrate run), with all progress saved in run_dir/state.json
-    ├── cycle 0: member 0..N-1, each with its own retries  ──all succeeded──▶  analysis
-    ├── cycle 1: same, using anything analysis passed on in next_cycle.json
-    └── ...
-```
+It runs **outside Flux**, such as on a login node in `tmux`, and refuses to start inside a Flux
+job or allocation. Every member and analysis is its own job in the queue. Flux does all the
+scheduling and launching. This adds what Flux has no feature for: retries, reacting to failure
+reasons, and waiting for all members across retries.
 
-The driver enforces the analysis dependency itself instead of using Flux `afterok`. A
-retried member gets a new job ID, and if an `afterok` target fails, Flux raises a fatal
-exception on the dependent job, so `afterok` cannot span retries.
-
-## Usage
+Flux's own dependencies can't span retries: an `afterok` job is rejected as soon as attempt 1
+fails, and `afterany` runs even if every attempt failed.
 
 ```bash
-bin/orchestrate validate configs/tuolumne.json   # check the config, show the time plan and commands
-bin/orchestrate batch    configs/tuolumne.json   # submit the driver with flux batch
-bin/orchestrate status   configs/tuolumne.json   # add --all to list every member
-bin/orchestrate run configs/smoke.json --backend local   # try it with no Flux at all
+./campaign.py run configs/tuolumne.json --dry-run   # print example flux commands
+./campaign.py run configs/tuolumne.json             # run or resume; keep this running
+./campaign.py status configs/tuolumne.json          # from any shell
 ```
 
-To resume after a pause, a dead allocation or a time limit, run the same `batch` command again.
+Exit codes: 0 completed, 1 failed, 3 paused. If `campaign.py` stops, its jobs keep running in
+Flux, and running the same command again picks them back up. Rerunning a failed campaign retries
+its failed tasks with fresh budgets. Finished members are kept.
 
-Driver exit codes:
+Put `run_dir` on a file system that compute nodes can also see.
 
-| Code | Meaning |
+## Config
+
+See `configs/tuolumne.json`. Top-level `flux_args` go on every job, which suits the queue and
+bank. Each component's `flux_args` add its resources. All of them go straight to `flux submit`.
+
+## Time limits
+
+```
+job limit = estimate + buffer
+```
+
+Set `time.member`, `time.analysis` and `time.buffer`. Time spent waiting in the queue isn't
+limited or predicted. `status` shows measured runtimes next to your estimate.
+
+## Failures
+
+| How the job ended | Result |
 |---|---|
-| 0 | Completed |
-| 1 | Failed: a task ran out of retries. Fix the cause and rerun with `--retry-failed` |
-| 2 | Config error, or the config changed (accept with `--allow-config-change`) |
-| 3 | Paused: out of time, stopped by a signal, or Flux unreachable. Rerun to resume |
+| Flux result `CANCELED` | Not retried |
+| Exit code declared under `failures` | Predicted: uses that reason's `retries` |
+| Flux result `TIMEOUT`, with a `TIMEOUT` reason declared | Predicted |
+| Exit 0 | Success |
+| Anything else, such as a crash | Unpredicted: uses the component's `retries` |
+| Job unknown to Flux | Resubmitted, no retry used |
 
-`--retry-failed` reruns only the failed tasks in the current cycle, with a fresh retry
-budget and that task's settings from the current config. Finished members are kept.
-
-## Plugging in your components
-
-Set `ensemble.command` and `analysis.command` in the config. `examples/` has a template for
-each. A job runs in its own attempt directory and receives:
-
-| Variable | Set for | Meaning |
-|---|---|---|
-| `ORCH_PARAMS_FILE` | all | JSON parameters for this attempt |
-| `ORCH_ATTEMPT_DIR`, `ORCH_ATTEMPT`, `ORCH_CYCLE` | all | Where to write, and which run this is |
-| `ORCH_FAILURE_FILE` | all | Where to write a predicted-failure report |
-| `ORCH_ENSEMBLE_SIZE` | all | Number of members in this cycle |
-| `ORCH_PREV_ATTEMPT_DIR` | retries | The previous attempt, for restarting from a checkpoint |
-| `ORCH_PREV_ANALYSIS_DIR` | cycle > 0 | The last cycle's analysis output |
-| `ORCH_MEMBER_ID` | members | 0..N-1 |
-| `ORCH_MANIFEST` | analysis | Each member's successful directory. Always read paths from here |
-| `ORCH_NEXT_CYCLE_FILE` | analysis | Optional output that steers the next cycle |
-
-Commands may use `{config_dir}`, `{attempt_dir}`, `{cycle}`, `{attempt}` and `{member_id}`.
-
-To steer the next cycle, the analysis writes:
-`{"continue": true, "params": {...}, "member_params": {"3": {...}}}`. `"continue": false`
-ends the campaign early. These values carry into all later cycles.
-
-## How failures are handled
-
-Each finished attempt is classified by the first rule that matches:
-
-| # | Condition | Result | Consequence |
-|---|---|---|---|
-| 1 | Flux doesn't know the job (its allocation ended) | lost | Resubmit, no retry charged |
-| 2 | Flux result is `CANCELED` | canceled | Never retried |
-| 3 | `failure.json` names a declared reason | predicted | Follow that reason's policy |
-| 4 | Exit code is declared by a reason | predicted | Follow that reason's policy |
-| 5 | Flux result is `TIMEOUT` and a `TIMEOUT` policy exists | predicted | Follow that policy |
-| 6 | Exit 0 and all `expected_outputs` exist | success | |
-| 7 | Anything else, including undeclared reasons | unpredicted | Use `max_unpredicted_retries` |
-
-A component reports a predicted failure in one of two ways:
-
-- **Exit code only:** `exit 20`. Declared codes must be in 3..125, because 126 and up are
-  shell errors and signals.
-- **Report file:** write `$ORCH_FAILURE_FILE` and then exit. This can also carry a message
-  and new parameters, and it overrides the exit code:
-  `{"reason": "NUMERICAL_INSTABILITY", "message": "...", "suggested_params": {"dt": 0.001}}`
-
-Declare the reasons in `predicted_failures`, for either component:
+Set `retries` on `ensemble` and on `analysis` for unpredicted failures. It defaults to 0.
 
 ```json
-"NUMERICAL_INSTABILITY": {
-  "exit_code": 20,
-  "action": "reconfigure",
-  "max_retries": 3,
-  "changes": {"params": {"dt": {"scale": 0.5}}}
-}
+"NUMERICAL_INSTABILITY": {"exit_code": 20, "retries": 3, "set": {"solver": "safe"}},
+"BAD_INPUT":             {"exit_code": 22, "retries": 0},
+"TIMEOUT":               {"retries": 1, "time_scale": 1.5}
 ```
 
-| Action | Effect |
-|---|---|
-| `retry` | Rerun unchanged, up to `max_retries` |
-| `reconfigure` | Apply `changes`, then `suggested_params`, and rerun, up to `max_retries` |
-| `fatal` | Stop retrying this task |
+- `retries: 0` means fatal.
+- `set` changes parameters for the retry, and `time_scale` multiplies the time limit.
+- Before exiting, a job can write `$ORCH_DIR/retry_params.json` with new parameter values, such
+  as a halved `dt`.
+- Exit codes must be in 3..125.
 
-`changes` can use `set`, `scale` or `add` on `params` and `resources`. `time` takes only
-`set` or `scale`.
+Changed values last for that cycle only. To keep one, have the analysis pass it on.
 
-Retry budgets are per task and per cycle. Each reason has its own count, which is separate
-from `max_unpredicted_retries`. `max_total_attempts` (default 20) is a hard cap on all of
-them. A reconfigured value applies to that member for the rest of the cycle, and the next
-cycle starts again from the config plus anything the analysis passed on. To keep a change,
-have the analysis pass it on.
+## Your components
 
-If a task runs out of retries, the other members still finish so their work can be reused,
-and the analysis does not run.
+Each job runs in its own attempt directory and gets `ORCH_DIR`, `ORCH_PARAMS` (JSON file),
+`ORCH_CYCLE`, `ORCH_ATTEMPT` and `ORCH_ENSEMBLE_SIZE`. Members also get `ORCH_MEMBER_ID`. The
+analysis also gets `ORCH_MANIFEST`, which lists each member's successful directory.
 
-## Time budget
-
-Give the expected runtimes and the buffer, and the job and allocation limits are calculated:
-
-```json
-"timing": {
-  "member_estimate": "45m",
-  "analysis_estimate": "15m",
-  "buffer": "15m",
-  "allocation_reserve": "1h"
-},
-"allocation": {"nodes": 16, "max_time": "12h", "queue": "pbatch", "bank": "YOUR_BANK"}
-```
-
-```
-member limit   = member_estimate + buffer
-analysis limit = analysis_estimate + buffer
-waves          = ceil(size × nodes per member / allocation nodes)
-each cycle     = waves × member limit + analysis limit
-campaign       = cycles × each cycle + allocation_reserve
-```
-
-- **`buffer`** is added to each job's limit.
-- **`allocation_reserve`** is added once, as room for retries. Without it, the plan has no
-  time for reruns.
-- **`allocation.nodes`** defaults to enough for all members at once.
-- **`allocation.time`**, if set, replaces the calculated time. You get a warning if it is
-  shorter than the plan.
-- **`allocation.max_time`** caps the calculated time. A campaign longer than the cap pauses
-  and continues in the next allocation.
-
-Setting both `timing` and a component's `resources.time` is an error.
-
-The driver also checks each job's limit against the allocation's remaining time before
-submitting it. If the job can't fit, it isn't submitted, and once nothing else is running
-the driver pauses with exit code 3. This covers one job at a time. Queued jobs, such as
-later waves, can still run out of time; they are then resubmitted at no charge on resume.
-
-`status` prints measured member runtimes next to the estimate, so you can tune it.
-
-## Notes on Tuolumne
-
-- Put `queue` and `bank` only under `allocation`. Jobs inside an allocation go to its own
-  Flux instance, which rejects `-q pbatch`, so `resources` does not accept `queue`.
-- [LC's page for Tuolumne](https://hpc.llnl.gov/hardware/compute-platforms/tuolumne) prohibits
-  batch jobs and job chaining in `pdebug`, so use `pbatch` for real campaigns. Check the
-  current limits with `joblimits`.
-- With several MPI ranks, only rank 0 should write the failure report. After the first rank
-  exits, Flux waits for `exit-timeout` (30 s in testing) before ending the job.
+The analysis can write `$ORCH_DIR/next_cycle.json`:
+`{"continue": true, "params": {...}}`. Those values carry into later cycles, and
+`"continue": false` ends the campaign early.
 
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests                # local; the real-Flux tests are skipped
-flux start --test-size=2 python3 -m unittest discover -s tests   # also runs against real Flux
+flux start --test-size=2 python3 -m unittest discover -s tests
 ```
 
-**Smoke test on Tuolumne**, using a short interactive debug allocation:
+On Tuolumne, set your bank in `configs/smoke.json`, then from a login node, outside any
+allocation:
 
 ```bash
-flux alloc -N2 -q pdebug -t 30m
-python3 -m unittest discover -s tests
-bin/orchestrate run configs/smoke.json
-bin/orchestrate status configs/smoke.json
+flux getattr instance-level        # must print 0, or campaign.py refuses to start
 flux jobs -n -o '{id}' f111111     # must print: JobID f111111 unknown
+./campaign.py run configs/smoke.json
+./campaign.py status configs/smoke.json
 ```
 
-Run the last command because the driver matches that exact wording to detect lost jobs. If
-your Flux version words it differently, resumed campaigns pause with exit code 3 instead of
-resubmitting anything. The fix is `UNKNOWN_JOB_RE` in `orchestrator/backends.py`.
+Lost jobs are detected from that exact wording. If yours differs, a campaign with a lost job
+pauses instead of resubmitting; fix the pattern in `parse_jobs`.
 
-## Known limitations
+`configs/smoke.json` uses `pbatch` because LC's Tuolumne page prohibits batch jobs and job chaining
+in `pdebug`. Check LC's current rules on job counts and long-running login-node processes before
+a large campaign.
 
-- Don't run two drivers on the same `run_dir`. Nothing prevents it, and it would submit
-  duplicate jobs.
-- If the driver dies in the moment between submitting a job and recording its ID, that job
-  keeps running untracked. It can't overwrite anything, because the rerun uses a new
-  attempt directory.
-- A job that finished just as its allocation died counts as lost and runs again.
-- `ensemble.size` applies from the next cycle if changed during a run.
+## Limitations
+
+- Each job and retry queues separately, so members may not run at the same time, and the analysis
+  waits in the queue too.
+- `campaign.py` must keep running for new jobs to be submitted. If it stops, restart it by hand.
+- Exit 0 counts as success, so a member that exits 0 without its output only shows up when the
+  analysis fails. Have members exit nonzero if their output is missing.
+- Don't run two copies on one `run_dir`.
+- If `campaign.py` dies in the moment between a submit and recording the job ID, that job keeps
+  running untracked, and its member is submitted again in a new directory.

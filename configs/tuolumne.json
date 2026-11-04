@@ -1,73 +1,26 @@
 {
-  "campaign_name": "sagest",
+  "name": "sagest",
   "run_dir": "../runs/sagest",
-  "backend": "flux",
   "cycles": 3,
-  "poll_interval_seconds": 15,
-
-  "timing": {
-    "member_estimate": "45m",
-    "analysis_estimate": "15m",
-    "buffer": "15m",
-    "allocation_reserve": "1h"
-  },
-
-  "allocation": {
-    "nodes": 16,
-    "max_time": "12h",
-    "queue": "pbatch",
-    "bank": "YOUR_BANK"
-  },
-
+  "poll_seconds": 60,
+  "time": {"member": "45m", "analysis": "15m", "buffer": "15m"},
+  "flux_args": ["-q", "pbatch", "-B", "YOUR_BANK"],
   "ensemble": {
     "size": 16,
+    "flux_args": ["-N1", "-n4", "-c24", "-g1", "--exclusive"],
     "command": ["python3", "{config_dir}/../examples/ensemble_member.py"],
-    "resources": {
-      "nodes": 1,
-      "tasks": 4,
-      "cores_per_task": 24,
-      "gpus_per_task": 1,
-      "exclusive": true
-    },
     "params": {"dt": 0.01},
-    "expected_outputs": ["result.json"],
-    "max_unpredicted_retries": 2,
-    "retry_delay_seconds": 30,
-    "max_total_attempts": 10,
-    "predicted_failures": {
-      "NUMERICAL_INSTABILITY": {
-        "exit_code": 20,
-        "action": "reconfigure",
-        "max_retries": 3,
-        "changes": {"params": {"dt": {"scale": 0.5}}},
-        "description": "The solver diverged, so retry with a smaller time step."
-      },
-      "TRANSIENT_IO": {
-        "exit_code": 21,
-        "action": "retry",
-        "max_retries": 3,
-        "description": "A known file system problem; rerun unchanged."
-      },
-      "BAD_INPUT": {
-        "exit_code": 22,
-        "action": "fatal",
-        "description": "The input is invalid, so another run cannot help."
-      },
-      "TIMEOUT": {
-        "action": "reconfigure",
-        "max_retries": 1,
-        "changes": {"resources": {"time": {"scale": 1.5}}},
-        "description": "Flux hit the time limit; retry with 50% more time."
-      }
+    "retries": 2,
+    "failures": {
+      "NUMERICAL_INSTABILITY": {"exit_code": 20, "retries": 3},
+      "TRANSIENT_IO": {"exit_code": 21, "retries": 3},
+      "BAD_INPUT": {"exit_code": 22, "retries": 0},
+      "TIMEOUT": {"retries": 1, "time_scale": 1.5}
     }
   },
-
   "analysis": {
+    "flux_args": ["-N1", "-c24", "--exclusive"],
     "command": ["python3", "{config_dir}/../examples/post_analysis.py"],
-    "resources": {"nodes": 1, "tasks": 1, "cores_per_task": 24, "exclusive": true},
-    "expected_outputs": ["analysis.json"],
-    "max_unpredicted_retries": 2,
-    "retry_delay_seconds": 30,
-    "predicted_failures": {}
+    "retries": 2
   }
 }

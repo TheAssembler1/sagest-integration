@@ -1,46 +1,28 @@
 #!/usr/bin/env python3
-"""Placeholder ensemble member. Replace it with your code, keeping the failure protocol.
+"""Placeholder member. Replace with your code.
 
-Inputs come from ORCH_* environment variables and the JSON file at ORCH_PARAMS_FILE.
-To end with a predicted failure, write the report and exit with the declared code.
-A plain crash needs no handling: the orchestrator counts it as unpredicted.
-With several MPI ranks, only rank 0 should write the report.
+Predicted failure: exit with a code declared under ensemble.failures in the config.
+Optionally write $ORCH_DIR/retry_params.json first to change parameters for the retry.
+Crashes need no handling; they count as unpredicted failures.
 """
 import json
 import os
 import sys
 import time
 
+with open(os.environ["ORCH_PARAMS"]) as handle:
+    params = json.load(handle)
+member, attempt = int(os.environ["ORCH_MEMBER_ID"]), int(os.environ["ORCH_ATTEMPT"])
+print(f"member {member} attempt {attempt}: {params}")
 
-def predicted_failure(reason, exit_code, message, suggested_params=None):
-    """Report why this attempt failed. The exit code alone also works, without the details."""
-    with open(os.environ["ORCH_FAILURE_FILE"], "w") as handle:
-        json.dump({"reason": reason, "message": message,
-                   "suggested_params": suggested_params or {}}, handle)
-    sys.exit(exit_code)
+# Demo failures: member 1 crashes once, and member 2 needs a smaller dt.
+if params.get("demo_failures") and member == 1 and attempt == 1:
+    raise RuntimeError("simulated crash")
+if params.get("demo_failures") and member == 2 and params["dt"] > 0.005:
+    with open(os.path.join(os.environ["ORCH_DIR"], "retry_params.json"), "w") as handle:
+        json.dump({"dt": params["dt"] / 2}, handle)
+    sys.exit(20)
 
-
-def main():
-    with open(os.environ["ORCH_PARAMS_FILE"]) as handle:
-        params = json.load(handle)
-    member = int(os.environ["ORCH_MEMBER_ID"])
-    attempt = int(os.environ["ORCH_ATTEMPT"])
-    print("member {} attempt {} cycle {} params {}".format(
-        member, attempt, os.environ["ORCH_CYCLE"], params))
-
-    # Demo failure modes, switched on per member from the config's member_params.
-    if params.get("crash_on_attempt") == attempt:
-        raise RuntimeError("simulated unpredicted crash")
-    limit = params.get("stability_limit")
-    if limit is not None and params["dt"] > limit:
-        predicted_failure("NUMERICAL_INSTABILITY", 20,
-                          "dt={} exceeds stability limit {}".format(params["dt"], limit))
-
-    time.sleep(params.get("sleep_seconds", 0))
-    result = {"member": member, "value": member * params["dt"] + params.get("forcing", 0.0)}
-    with open(os.path.join(os.environ["ORCH_ATTEMPT_DIR"], "result.json"), "w") as handle:
-        json.dump(result, handle)
-
-
-if __name__ == "__main__":
-    main()
+time.sleep(params.get("sleep_seconds", 0))
+with open(os.path.join(os.environ["ORCH_DIR"], "result.json"), "w") as handle:
+    json.dump({"value": member * params["dt"] + params.get("forcing", 0.0)}, handle)

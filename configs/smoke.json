@@ -1,40 +1,21 @@
 {
-  "campaign_name": "smoke",
+  "name": "smoke",
   "run_dir": "../runs/smoke",
-  "backend": "flux",
   "cycles": 2,
-  "poll_interval_seconds": 2,
-
-  "timing": {
-    "member_estimate": "1m",
-    "analysis_estimate": "1m",
-    "buffer": "1m"
-  },
-
+  "poll_seconds": 5,
+  "time": {"member": "1m", "analysis": "1m", "buffer": "1m"},
+  "flux_args": ["-q", "pbatch", "-B", "YOUR_BANK"],
   "ensemble": {
     "size": 4,
     "command": ["python3", "{config_dir}/../examples/ensemble_member.py"],
-    "params": {"dt": 0.01, "sleep_seconds": 1},
-    "member_params": {
-      "1": {"crash_on_attempt": 1},
-      "2": {"stability_limit": 0.005}
-    },
-    "expected_outputs": ["result.json"],
-    "max_unpredicted_retries": 2,
-    "retry_delay_seconds": 1,
-    "predicted_failures": {
-      "NUMERICAL_INSTABILITY": {
-        "exit_code": 20,
-        "action": "reconfigure",
-        "max_retries": 3,
-        "changes": {"params": {"dt": {"scale": 0.5}}}
-      }
+    "params": {"dt": 0.01, "sleep_seconds": 5, "demo_failures": true},
+    "retries": 2,
+    "failures": {
+      "NUMERICAL_INSTABILITY": {"exit_code": 20, "retries": 3}
     }
   },
-
   "analysis": {
     "command": ["python3", "{config_dir}/../examples/post_analysis.py"],
-    "expected_outputs": ["analysis.json"],
-    "retry_delay_seconds": 1
+    "retries": 2
   }
 }
