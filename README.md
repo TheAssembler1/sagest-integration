@@ -1,5 +1,8 @@
 # Minimal Flux ensemble wrapper
 
+**Full documentation: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)**, covering every command, config
+setting, file and behavior.
+
 `campaign.py` runs N ensemble members (one Flux job each), then a post-analysis job once all
 N have succeeded, and repeats for a set number of cycles. Flux does all the scheduling and
 launching. This adds what Flux has no feature for: retries, reacting to failure reasons, and
@@ -30,7 +33,7 @@ except that allocation mode refuses to take over jobs still running from the log
 ./campaign.py status configs/tuolumne.json          # from any shell
 ```
 
-Exit codes: 0 completed, 1 failed, 3 paused. Rerunning continues a paused campaign, and retries
+Exit codes: 0 completed, 1 failed, 2 invalid config, 3 paused. Rerunning continues a paused campaign, and retries
 a failed one's failed tasks with fresh budgets. Finished members are kept.
 
 Put `run_dir` on a file system that compute nodes can also see.

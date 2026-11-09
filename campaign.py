@@ -9,7 +9,7 @@ Flux schedules and launches every job. This only adds what Flux has no feature f
 retries, reacting to failure reasons, waiting for all members across retries, and cycles.
 
 Usage: campaign.py run|batch CONFIG [--dry-run]  |  campaign.py status CONFIG
-Exit codes: 0 completed, 1 failed, 3 paused. Rerun the same command to resume; rerunning
+Exit codes: 0 completed, 1 failed, 2 invalid config, 3 paused. Rerun the same command to resume; rerunning
 a failed campaign retries its failed tasks with fresh retry budgets.
 """
 import argparse
@@ -29,6 +29,14 @@ NO_TIME_LIMIT = 2 ** 31  # `flux job timeleft` prints UINT32_MAX when unlimited
 LIFETIME_ERROR = "exceeds remaining instance lifetime"
 
 
+EXIT_CONFIG = 2          # the config is invalid; nothing was started
+
+
+def config_error(message):
+    print(message, file=sys.stderr)
+    sys.exit(EXIT_CONFIG)
+
+
 class Pause(Exception):
     pass
 
@@ -44,7 +52,7 @@ def log(message):
 def seconds(duration):
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", str(duration))
     if not match:
-        sys.exit(f"config error: bad duration {duration!r} (use e.g. 90s, 30m, 4h)")
+        config_error(f"config error: bad duration {duration!r} (use e.g. 90s, 30m, 4h)")
     return float(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
 
 
@@ -108,24 +116,121 @@ def detect_mode():
 
 # ---- config -----------------------------------------------------------------------------
 
+# Every key a config may contain: name -> (type check, required). Anything else is an error.
+def _int(low, high=None):
+    return lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= low and \
+        (high is None or v <= high), f"an integer >= {low}" + (f" and <= {high}" if high else "")
+
+
+_POSITIVE = (lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+             "a number > 0")
+_TEXT = (lambda v: isinstance(v, str) and v != "", "a non-empty string")
+_NAME = (lambda v: isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", v) is not None,
+         "letters, digits, _ . or - only")
+_OBJECT = (lambda v: isinstance(v, dict), "an object")
+_ARGS = (lambda v: isinstance(v, list) and all(isinstance(a, str) for a in v), "a list of strings")
+_COMMAND = (lambda v: isinstance(v, list) and v != [] and all(isinstance(a, str) for a in v),
+            "a non-empty list of strings")
+_DURATION = (lambda v: isinstance(v, str) and re.fullmatch(r"\d+(\.\d+)?[smhd]", v) is not None,
+             "a duration like 90s, 30m, 1.5h or 2d")
+_RUN_TIME = (lambda v: _DURATION[0](v) and seconds(v) > 0, "a duration greater than 0, like 30m")
+
+TOP = {"name": (_NAME, True), "run_dir": (_TEXT, True), "cycles": (_int(1), False),
+       "poll_seconds": (_POSITIVE, False), "queue": (_TEXT, False), "bank": (_TEXT, False),
+       "time": (_OBJECT, True), "allocation": (_OBJECT, False),
+       "ensemble": (_OBJECT, True), "analysis": (_OBJECT, True)}
+TIME = {"member": (_RUN_TIME, True), "analysis": (_RUN_TIME, True),
+        "buffer": (_DURATION, False), "reserve": (_DURATION, False)}
+ALLOCATION = {"nodes": (_int(1), False), "time": (_RUN_TIME, False),
+              "max_time": (_RUN_TIME, False), "flux_args": (_ARGS, False)}
+COMPONENT = {"command": (_COMMAND, True), "nodes": (_int(1), False), "flux_args": (_ARGS, False),
+             "params": (_OBJECT, False), "retries": (_int(0), False),
+             "failures": (_OBJECT, False)}
+ENSEMBLE = dict(COMPONENT, size=(_int(1), True))
+RULE = {"exit_code": (_int(3, 125), False), "retries": (_int(0), True), "set": (_OBJECT, False),
+        "time_scale": (_POSITIVE, False)}
+
+# Flags campaign.py sets itself, so flux_args must not repeat them.
+MANAGED_FLAGS = ["--job-name", "--cwd", "--output", "--error", "-t", "--time-limit",
+                 "-q", "--queue", "-B", "--bank"]
+
+
+def _check(obj, schema, where, errors):
+    """Append an error for each unknown, missing or wrongly typed key; return the valid keys."""
+    if not isinstance(obj, dict):
+        errors.append(f"{where}: must be an object")
+        return {}
+    for key in obj:
+        if key not in schema:
+            errors.append(f"{where}.{key}: unknown key (allowed: {', '.join(sorted(schema))})")
+    valid = {}
+    for key, ((test, expected), required) in schema.items():
+        if key not in obj:
+            if required:
+                errors.append(f"{where}.{key}: required")
+        elif not test(obj[key]):
+            errors.append(f"{where}.{key}: must be {expected}, got {json.dumps(obj[key])}")
+        else:
+            valid[key] = obj[key]
+    return valid
+
+
+def _check_flags(args, flags, where, errors):
+    for arg in args:
+        for flag in flags:
+            short = not flag.startswith("--")
+            if arg == flag or arg.startswith(flag + "=") or (short and arg.startswith(flag)):
+                errors.append(f"{where}: {arg!r} is set by campaign.py; remove it")
+
+
+def validate(cfg):
+    """Return a list of every problem in a config; empty if it is valid."""
+    errors = []
+    top = _check(cfg, TOP, "config", errors)
+    _check(top.get("time", {}), TIME, "time", errors)
+    alloc = _check(top.get("allocation", {}), ALLOCATION, "allocation", errors)
+    _check_flags(alloc.get("flux_args", []), MANAGED_FLAGS + ["-N", "--nodes", "--exclusive"],
+                 "allocation.flux_args", errors)
+    if "time" in alloc and "max_time" in alloc:
+        errors.append("allocation: set time or max_time, not both")
+    for name, schema in (("ensemble", ENSEMBLE), ("analysis", COMPONENT)):
+        if name not in top:
+            continue
+        comp = _check(top[name], schema, name, errors)
+        flags = MANAGED_FLAGS + (["-N", "--nodes"] if "nodes" in comp else [])
+        _check_flags(comp.get("flux_args", []), flags, f"{name}.flux_args", errors)
+        codes = {}
+        for reason, rule in comp.get("failures", {}).items():
+            where = f"{name}.failures.{reason}"
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", reason):
+                errors.append(f"{where}: reason names must be UPPER_CASE, like BAD_INPUT")
+            given = rule
+            rule = _check(rule, RULE, where, errors)
+            if reason != "TIMEOUT" and isinstance(given, dict) and "exit_code" not in given:
+                errors.append(f"{where}.exit_code: required (only TIMEOUT can omit it)")
+            code = rule.get("exit_code")
+            if code is not None and code in codes:
+                errors.append(f"{where}.exit_code: {code} is already used by {codes[code]}")
+            codes.setdefault(code, reason)
+    return errors
+
+
 def load_config(path):
     path = os.path.abspath(path)
-    with open(path) as handle:
-        cfg = json.load(handle)
+    try:
+        with open(path) as handle:
+            cfg = json.load(handle)
+    except (OSError, ValueError) as exc:
+        config_error(f"config error: cannot read {path}: {exc}")
+    errors = validate(cfg)
+    if errors:
+        config_error("\n".join(f"config error: {error}" for error in errors))
     base = os.path.dirname(path)
     cfg["config_path"] = path
     cfg["run_dir"] = os.path.normpath(os.path.join(base, cfg["run_dir"]))
     for name in ("ensemble", "analysis"):
         comp = cfg[name]
         comp["command"] = [c.replace("{config_dir}", base) for c in comp["command"]]
-        for reason, rule in comp.get("failures", {}).items():
-            where = f"{name}.failures.{reason}"
-            unknown = set(rule) - {"exit_code", "retries", "set", "time_scale"}
-            if unknown or not isinstance(rule.get("retries"), int):
-                sys.exit(f"config error: {where} needs integer retries; unknown keys: {unknown}")
-            if reason != "TIMEOUT" and not 3 <= rule.get("exit_code", 0) <= 125:
-                sys.exit(f"config error: {where} needs an exit_code in 3..125")
-    time_limit(cfg, "ensemble"), time_limit(cfg, "analysis")
     return cfg
 
 
@@ -136,7 +241,7 @@ def plan(cfg):
     nodes = alloc.get("nodes", size * member_nodes)
     for name in ("ensemble", "analysis"):
         if cfg[name].get("nodes", 1) > nodes:
-            sys.exit(f"config error: {name} needs more nodes than allocation.nodes ({nodes})")
+            config_error(f"config error: {name} needs more nodes than allocation.nodes ({nodes})")
     waves = math.ceil(size * member_nodes / nodes)
     total = cfg.get("cycles", 1) * (waves * time_limit(cfg, "ensemble")
                                     + time_limit(cfg, "analysis"))
@@ -488,7 +593,7 @@ def main():
         sys.exit("error: start campaign.py on a login node or inside flux batch or flux alloc, "
                  "not inside a single job")
     if mode == "login" and cfg.get("bank") == "YOUR_BANK":
-        sys.exit("config error: set bank in the config")
+        config_error("config error: set bank in the config")
     if args.command == "batch":
         if mode != "login":
             sys.exit("error: run batch from a login node")

@@ -100,6 +100,157 @@ class ParsingTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "run")))
 
 
+class ValidationTests(unittest.TestCase):
+    def base(self):
+        return {"name": "t", "run_dir": "run", "cycles": 2, "poll_seconds": 5,
+                "queue": "pbatch", "bank": "b",
+                "time": {"member": "1m", "analysis": "1m", "buffer": "30s", "reserve": "0s"},
+                "allocation": {"nodes": 2, "max_time": "1h", "flux_args": ["--urgency=20"]},
+                "ensemble": {"size": 4, "nodes": 1, "command": ["run"], "flux_args": ["-n4"],
+                             "params": {"dt": 0.1}, "retries": 2,
+                             "failures": {"BAD": {"exit_code": 20, "retries": 0,
+                                                  "set": {"a": 1}, "time_scale": 2},
+                                          "TIMEOUT": {"retries": 1, "time_scale": 1.5}}},
+                "analysis": {"command": ["an"]}}
+
+    def errors_for(self, change):
+        cfg = self.base()
+        change(cfg)
+        return campaign.validate(cfg)
+
+    def assert_rejected(self, change, *fragments):
+        errors = self.errors_for(change)
+        text = "\n".join(errors)
+        for fragment in fragments:
+            self.assertIn(fragment, text)
+
+    def test_valid_and_shipped_configs_pass(self):
+        self.assertEqual(campaign.validate(self.base()), [])
+        for name in ("tuolumne.json", "smoke.json"):
+            with open(os.path.join(ROOT, "configs", name)) as handle:
+                self.assertEqual(campaign.validate(json.load(handle)), [], name)
+
+    def test_unknown_keys_at_every_level(self):
+        self.assert_rejected(lambda c: c.update(cycels=3), "config.cycels: unknown key")
+        self.assert_rejected(lambda c: c["time"].update(bufer="1m"), "time.bufer: unknown key")
+        self.assert_rejected(lambda c: c["allocation"].update(node=2),
+                             "allocation.node: unknown key")
+        self.assert_rejected(lambda c: c["ensemble"].update(retires=1),
+                             "ensemble.retires: unknown key")
+        self.assert_rejected(lambda c: c["analysis"].update(size=1), "analysis.size: unknown key")
+        self.assert_rejected(lambda c: c["ensemble"]["failures"]["BAD"].update(retry=1),
+                             "ensemble.failures.BAD.retry: unknown key")
+
+    def test_missing_required_keys(self):
+        self.assert_rejected(lambda c: c.pop("name"), "config.name: required")
+        self.assert_rejected(lambda c: c["time"].pop("member"), "time.member: required")
+        self.assert_rejected(lambda c: c["ensemble"].pop("size"), "ensemble.size: required")
+        self.assert_rejected(lambda c: c["analysis"].pop("command"), "analysis.command: required")
+        self.assert_rejected(lambda c: c["ensemble"]["failures"]["BAD"].pop("retries"),
+                             "ensemble.failures.BAD.retries: required")
+        self.assert_rejected(lambda c: c["ensemble"]["failures"]["BAD"].pop("exit_code"),
+                             "BAD.exit_code: required (only TIMEOUT can omit it)")
+
+    def test_wrong_types_and_ranges(self):
+        cases = [
+            (lambda c: c.update(cycles=0), "config.cycles: must be an integer >= 1"),
+            (lambda c: c.update(cycles=True), "config.cycles: must be an integer"),
+            (lambda c: c.update(poll_seconds=0), "config.poll_seconds: must be a number > 0"),
+            (lambda c: c.update(name="my run"), "config.name: must be letters"),
+            (lambda c: c["time"].update(member="30"), "time.member: must be a duration"),
+            (lambda c: c["time"].update(member="0s"), "time.member: must be a duration greater"),
+            (lambda c: c["time"].update(buffer=60), "time.buffer: must be a duration"),
+            (lambda c: c["ensemble"].update(size="16"), "ensemble.size: must be an integer"),
+            (lambda c: c["ensemble"].update(command="run.sh"), "ensemble.command: must be a non-empty list"),
+            (lambda c: c["ensemble"].update(command=[]), "ensemble.command: must be a non-empty list"),
+            (lambda c: c["ensemble"].update(retries=-1), "ensemble.retries: must be an integer >= 0"),
+            (lambda c: c["ensemble"].update(flux_args="-n4"), "ensemble.flux_args: must be a list"),
+            (lambda c: c["ensemble"].update(params=[1]), "ensemble.params: must be an object"),
+            (lambda c: c["ensemble"]["failures"]["BAD"].update(exit_code=1),
+             "BAD.exit_code: must be an integer >= 3 and <= 125"),
+            (lambda c: c["ensemble"]["failures"]["BAD"].update(exit_code=139), "<= 125"),
+            (lambda c: c["ensemble"]["failures"]["BAD"].update(time_scale=0), "time_scale: must be a number > 0"),
+            (lambda c: c.update(time=[]), "config.time: must be an object"),
+        ]
+        for change, fragment in cases:
+            with self.subTest(fragment=fragment):
+                self.assert_rejected(change, fragment)
+
+    def test_failure_rules(self):
+        self.assert_rejected(lambda c: c["ensemble"]["failures"].update(
+            OTHER={"exit_code": 20, "retries": 1}), "OTHER.exit_code: 20 is already used by BAD")
+        self.assert_rejected(lambda c: c["ensemble"]["failures"].update(
+            bad_input={"exit_code": 22, "retries": 0}), "bad_input: reason names must be UPPER_CASE")
+        self.assert_rejected(lambda c: c["ensemble"]["failures"].update(X=[]),
+                             "ensemble.failures.X: must be an object")
+
+    def test_flags_campaign_sets_are_refused(self):
+        for arg in ("-t", "-t60", "--time-limit=60", "--job-name=x", "--output=o", "-q",
+                    "--queue=pbatch", "-Bbank", "--cwd=/tmp", "--error=e"):
+            with self.subTest(arg=arg):
+                self.assert_rejected(lambda c: c["ensemble"].update(flux_args=[arg]),
+                                     f"ensemble.flux_args: {arg!r} is set by campaign.py")
+        self.assert_rejected(lambda c: c["ensemble"].update(flux_args=["-N2"]), "'-N2' is set")
+        self.assertEqual(self.errors_for(lambda c: (c["ensemble"].pop("nodes"),
+                                                    c["ensemble"].update(flux_args=["-N2"]))), [])
+        self.assertEqual(self.errors_for(lambda c: c["ensemble"].update(
+            flux_args=["--tasks-per-node=4", "-n4", "-c24", "-g1", "--exclusive"])), [])
+        self.assert_rejected(lambda c: c["allocation"].update(flux_args=["--exclusive"]),
+                             "allocation.flux_args: '--exclusive' is set")
+        self.assert_rejected(lambda c: c["allocation"].update(time="2h"),
+                             "allocation: set time or max_time, not both")
+
+    def test_other_config_errors_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "c.json")
+            cfg = self.base()
+            cfg["bank"] = "YOUR_BANK"
+            with open(path, "w") as handle:
+                json.dump(cfg, handle)
+            env = {k: v for k, v in os.environ.items() if k != "FLUX_JOB_ID"}
+            done = subprocess.run([sys.executable, os.path.join(ROOT, "campaign.py"), "run", path],
+                                  env=env, stderr=subprocess.PIPE, encoding="utf-8")
+            self.assertIn("set bank", done.stderr)
+            self.assertEqual(done.returncode, 2)
+            cfg["bank"] = "b"
+            cfg["allocation"] = {"nodes": 1}
+            cfg["ensemble"]["nodes"] = 2
+            with open(path, "w") as handle:
+                json.dump(cfg, handle)
+            done = subprocess.run([sys.executable, os.path.join(ROOT, "campaign.py"), "run", path,
+                                   "--dry-run"], stderr=subprocess.PIPE, encoding="utf-8")
+            self.assertIn("needs more nodes", done.stderr)
+            self.assertEqual(done.returncode, 2)
+
+    def test_bad_exit_code_is_reported_once(self):
+        errors = self.errors_for(lambda c: c["ensemble"]["failures"]["BAD"].update(exit_code=1))
+        self.assertEqual(len(errors), 1, errors)
+
+    def test_every_problem_is_reported_at_once(self):
+        errors = self.errors_for(lambda c: (c.update(cycels=1), c["time"].pop("member"),
+                                            c["ensemble"].update(size=0)))
+        self.assertEqual(len(errors), 3, errors)
+
+    def test_cli_prints_all_errors_and_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "c.json")
+            cfg = self.base()
+            cfg.update(cycels=1)
+            cfg["time"]["member"] = "30"
+            with open(path, "w") as handle:
+                json.dump(cfg, handle)
+            done = subprocess.run([sys.executable, os.path.join(ROOT, "campaign.py"), "status",
+                                   path], stderr=subprocess.PIPE, encoding="utf-8")
+            self.assertEqual(done.returncode, 2)
+            self.assertEqual(done.stderr.count("config error:"), 2, done.stderr)
+            with open(path, "w") as handle:
+                handle.write("{not json")
+            done = subprocess.run([sys.executable, os.path.join(ROOT, "campaign.py"), "status",
+                                   path], stderr=subprocess.PIPE, encoding="utf-8")
+            self.assertIn("config error: cannot read", done.stderr)
+            self.assertEqual(done.returncode, 2)
+
+
 @unittest.skipUnless(IN_FLUX, "needs a Flux instance")
 class CampaignTests(unittest.TestCase):
     def setUp(self):
