@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -39,14 +40,52 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(campaign.time_limit(cfg, "ensemble"), 3600)
         self.assertEqual(campaign.time_limit(cfg, "analysis"), 1800)
 
-    def test_common_and_component_flux_args_reach_submit(self):
-        cfg = {"flux_args": ["-q", "pbatch"],
-               "ensemble": {"flux_args": ["-N1"], "command": ["a"]}}
-        args = campaign.submit_args(cfg, "ensemble", "n", "/d", 60.5)
-        self.assertEqual(args, ["submit", "--job-name=n", "--cwd=/d", "--output=stdout.log",
-                                "--error=stderr.log", "-t", "61s", "-q", "pbatch", "-N1", "a"])
+    def test_queue_and_bank_only_on_login_node_jobs(self):
+        cfg = {"queue": "pbatch", "bank": "b",
+               "ensemble": {"nodes": 2, "flux_args": ["-n4"], "command": ["a"]}}
+        head = ["submit", "--job-name=n", "--cwd=/d", "--output=stdout.log",
+                "--error=stderr.log", "-t", "61s"]
+        self.assertEqual(campaign.submit_args(cfg, "login", "ensemble", "n", "/d", 60.5),
+                         head + ["-q", "pbatch", "-B", "b", "-N", "2", "-n4", "a"])
+        self.assertEqual(campaign.submit_args(cfg, "allocation", "ensemble", "n", "/d", 60.5),
+                         head + ["-N", "2", "-n4", "a"])
 
-    def test_refuses_to_run_inside_a_flux_job(self):
+    def test_mode_comes_from_where_it_starts(self):
+        real_flux = campaign.flux
+        self.addCleanup(setattr, campaign, "flux", real_flux)
+        cases = [((0, "1\n", ""), {}, "allocation"), ((0, "0\n", ""), {}, "login"),
+                 ((1, "", "no flux"), {}, "login"),
+                 ((0, "0\n", ""), {"FLUX_JOB_ID": "fA"}, None),
+                 ((0, "2\n", ""), {"FLUX_JOB_ID": "fA"}, "allocation")]
+        for result, env, expected in cases:
+            campaign.flux = lambda *args, **kwargs: result
+            with unittest.mock.patch.dict(os.environ, env):
+                if "FLUX_JOB_ID" not in env:
+                    os.environ.pop("FLUX_JOB_ID", None)
+                self.assertEqual(campaign.detect_mode(), expected, (result, env))
+
+    def test_allocation_plan_and_batch_command(self):
+        cfg = {"name": "x", "run_dir": "/r", "config_path": "/c.json", "cycles": 3,
+               "queue": "pbatch", "bank": "b",
+               "time": {"member": "8m", "analysis": "3m", "buffer": "2m", "reserve": "10m"},
+               "allocation": {"nodes": 8}, "ensemble": {"size": 16, "nodes": 1},
+               "analysis": {}}
+        times = campaign.plan(cfg)
+        self.assertEqual((times["nodes"], times["waves"]), (8, 2))
+        self.assertEqual(times["total"], 3 * (2 * 600 + 300) + 600)
+        self.assertEqual(times["request"], times["total"])
+        args = campaign.batch_args(cfg)
+        self.assertEqual(args[:9], ["batch", "-N", "8", "-t", "5100s", "--exclusive",
+                                    "--job-name=x", "-q", "pbatch"])
+        self.assertIn("--wrap", args)
+        self.assertEqual(args[-2:], ["run", "/c.json"])
+        cfg["allocation"]["max_time"] = "1h"
+        self.assertEqual(campaign.plan(cfg)["request"], 3600)
+        cfg["allocation"] = {"time": "2h"}
+        self.assertEqual(campaign.plan(cfg)["request"], 7200)
+        self.assertEqual(campaign.plan(cfg)["nodes"], 16)
+
+    def test_refuses_to_run_inside_a_single_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "c.json")
             with open(path, "w") as handle:
@@ -57,7 +96,7 @@ class ParsingTests(unittest.TestCase):
             done = subprocess.run([sys.executable, os.path.join(ROOT, "campaign.py"), "run", path],
                                   env=dict(os.environ, FLUX_JOB_ID="fA"), stderr=subprocess.PIPE)
             self.assertNotEqual(done.returncode, 0)
-            self.assertIn(b"outside Flux jobs", done.stderr)
+            self.assertIn(b"not inside a single job", done.stderr)
             self.assertFalse(os.path.exists(os.path.join(tmp, "run")))
 
 
@@ -79,7 +118,7 @@ class CampaignTests(unittest.TestCase):
         self.scripts = scripts or {}
         return self.cfg
 
-    def go(self, cfg=None):
+    def go(self, cfg=None, mode="login"):
         """Run the campaign, giving each named member its own script."""
         cfg = cfg or self.cfg
         original = campaign.member_params
@@ -96,7 +135,7 @@ class CampaignTests(unittest.TestCase):
             return params
         campaign.member_params = params_for_member
         try:
-            code = campaign.run(cfg)
+            code = campaign.run(cfg, mode)
         finally:
             campaign.member_params = original
         with open(os.path.join(cfg["run_dir"], "state.json")) as handle:
@@ -224,6 +263,55 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(code, 0)
         task = state["cycles"][0]["members"][0]
         self.assertEqual((task["attempt"], task["job"]), (1, first_job))
+
+    def test_allocation_pauses_when_job_cannot_fit_then_resumes(self):
+        self.config(size=1)
+        real_timeleft = campaign.timeleft
+        self.addCleanup(setattr, campaign, "timeleft", real_timeleft)
+        campaign.timeleft = lambda: 59
+        code, state = self.go(mode="allocation")
+        self.assertEqual(code, 3)
+        self.assertEqual(state["cycles"][0]["members"][0]["attempt"], 0)
+        campaign.timeleft = lambda: 1000
+        self.assertEqual(self.go(mode="allocation")[0], 0)
+
+    def test_login_mode_never_checks_time_left(self):
+        self.config(size=1)
+        real_timeleft = campaign.timeleft
+        self.addCleanup(setattr, campaign, "timeleft", real_timeleft)
+        campaign.timeleft = lambda: 1
+        self.assertEqual(self.go(mode="login")[0], 0)
+
+    def test_lifetime_rejection_uses_no_retry(self):
+        self.config(size=1, ensemble={"retries": 0})
+        real_flux = campaign.flux
+        self.addCleanup(setattr, campaign, "flux", real_flux)
+        rejections = {"left": 1}
+
+        def rejects_once(*args, **kwargs):
+            if args[0] == "submit" and rejections["left"]:
+                rejections["left"] -= 1
+                return 1, "", "[Errno 22] job duration (2m) exceeds remaining instance lifetime"
+            return real_flux(*args, **kwargs)
+        campaign.flux = rejects_once
+        code, state = self.go(mode="allocation")
+        self.assertEqual(code, 0)
+        task = state["cycles"][0]["members"][0]
+        self.assertEqual((task["unpredicted"], task["history"][0]["kind"]), (0, "success"))
+
+    def test_allocation_refuses_to_take_over_login_node_jobs(self):
+        self.config(size=1)
+        self.assertEqual(self.go()[0], 0)
+        path = os.path.join(self.cfg["run_dir"], "state.json")
+        with open(path) as handle:
+            state = json.load(handle)
+        state["status"] = "paused"
+        state["cycles"][0]["analysis"] = None
+        state["cycles"][0]["members"][0].update(status="RUNNING", job="f111111", mode="login")
+        with open(path, "w") as handle:
+            json.dump(state, handle)
+        with self.assertRaises(SystemExit):
+            self.go(mode="allocation")
 
     def test_failed_status_queries_do_not_resubmit(self):
         self.config(size=1, ensemble={"retries": 0})

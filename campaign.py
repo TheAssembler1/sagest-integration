@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Minimal wrapper over Flux: ensemble -> post-analysis -> repeat. See README.md.
 
-Runs outside Flux, such as on a login node in tmux. Every member and analysis is its own
-Flux job, and Flux schedules and launches all of them. This only adds what Flux has no
-feature for: retries, reacting to failure reasons, waiting for all members across retries,
-and cycles.
+Runs in one of two modes, chosen by where `run` starts:
+  login       on a login node; each job goes to the queue on its own (-q, -B)
+  allocation  inside flux batch or flux alloc; jobs share the allocation's nodes
+`batch` sizes an allocation from the time estimates and starts `run` inside it.
+Flux schedules and launches every job. This only adds what Flux has no feature for:
+retries, reacting to failure reasons, waiting for all members across retries, and cycles.
 
-Usage: campaign.py run CONFIG [--dry-run]  |  campaign.py status CONFIG
+Usage: campaign.py run|batch CONFIG [--dry-run]  |  campaign.py status CONFIG
 Exit codes: 0 completed, 1 failed, 3 paused. Rerun the same command to resume; rerunning
 a failed campaign retries its failed tasks with fresh retry budgets.
 """
@@ -23,6 +25,8 @@ import time
 JOB_FORMAT = "{id.f58}|{result}|{returncode}|{runtime}|{exception.note}"
 MISSING_STRIKES = 3      # sightings as "unknown" before believing a job is gone
 MAX_POLL_FAILURES = 20   # failed status queries in a row before pausing
+NO_TIME_LIMIT = 2 ** 31  # `flux job timeleft` prints UINT32_MAX when unlimited
+LIFETIME_ERROR = "exceeds remaining instance lifetime"
 
 
 class Pause(Exception):
@@ -84,6 +88,24 @@ def parse_jobs(job_ids, code, out, err):
     return jobs
 
 
+def timeleft():
+    """Seconds left in this allocation, or None if it has no limit."""
+    code, out, _ = flux("job", "timeleft")
+    try:
+        left = float(out) if code == 0 else NO_TIME_LIMIT
+    except ValueError:
+        return None
+    return None if left >= NO_TIME_LIMIT else left
+
+
+def detect_mode():
+    """'allocation' inside flux batch or alloc, 'login' outside Flux, None inside a plain job."""
+    code, out, _ = flux("getattr", "instance-level")
+    if code == 0 and out.strip() not in ("", "0"):
+        return "allocation"
+    return None if "FLUX_JOB_ID" in os.environ else "login"
+
+
 # ---- config -----------------------------------------------------------------------------
 
 def load_config(path):
@@ -105,6 +127,25 @@ def load_config(path):
                 sys.exit(f"config error: {where} needs an exit_code in 3..125")
     time_limit(cfg, "ensemble"), time_limit(cfg, "analysis")
     return cfg
+
+
+def plan(cfg):
+    """Allocation size and time: cycles x (waves x member limit + analysis limit) + reserve."""
+    alloc, size = cfg.get("allocation", {}), cfg["ensemble"]["size"]
+    member_nodes = cfg["ensemble"].get("nodes", 1)
+    nodes = alloc.get("nodes", size * member_nodes)
+    for name in ("ensemble", "analysis"):
+        if cfg[name].get("nodes", 1) > nodes:
+            sys.exit(f"config error: {name} needs more nodes than allocation.nodes ({nodes})")
+    waves = math.ceil(size * member_nodes / nodes)
+    total = cfg.get("cycles", 1) * (waves * time_limit(cfg, "ensemble")
+                                    + time_limit(cfg, "analysis"))
+    total += seconds(cfg["time"].get("reserve", "0s"))
+    if "time" in alloc:
+        request = seconds(alloc["time"])
+    else:
+        request = min(total, seconds(alloc.get("max_time", "9999d")))
+    return {"nodes": nodes, "waves": waves, "total": total, "request": request}
 
 
 def time_limit(cfg, kind):
@@ -142,14 +183,22 @@ def new_cycle(cfg, state):
 
 # ---- one job ----------------------------------------------------------------------------
 
-def submit_args(cfg, kind, job_name, attempt_dir, limit):
+def queue_args(cfg):
+    return [arg for flag, key in (("-q", "queue"), ("-B", "bank")) if cfg.get(key)
+            for arg in (flag, cfg[key])]
+
+
+def submit_args(cfg, mode, kind, job_name, attempt_dir, limit):
     comp = cfg[kind]
+    nodes = ["-N", str(comp["nodes"])] if "nodes" in comp else []
+    # An allocation has its own scheduler, which rejects -q and -B.
+    queue = queue_args(cfg) if mode == "login" else []
     return ["submit", f"--job-name={job_name}", f"--cwd={attempt_dir}", "--output=stdout.log",
-            "--error=stderr.log", "-t", f"{math.ceil(limit)}s", *cfg.get("flux_args", []),
+            "--error=stderr.log", "-t", f"{math.ceil(limit)}s", *queue, *nodes,
             *comp.get("flux_args", []), *comp["command"]]
 
 
-def submit(cfg, state, task):
+def submit(cfg, mode, state, task):
     cycle = len(state["cycles"]) - 1
     attempt_dir = os.path.join(cfg["run_dir"], f"cycle_{cycle}", task["name"],
                                f"attempt_{task['attempt']}")
@@ -166,13 +215,18 @@ def submit(cfg, state, task):
     else:
         env["ORCH_MANIFEST"] = os.path.join(cfg["run_dir"], f"cycle_{cycle}", "manifest.json")
     job_name = f"{cfg['name']}-c{cycle}-{task['name']}-a{task['attempt']}"
-    code, out, err = flux(*submit_args(cfg, task["kind"], job_name, attempt_dir, task["time"]),
-                          env=env)
+    code, out, err = flux(*submit_args(cfg, mode, task["kind"], job_name, attempt_dir,
+                                       task["time"]), env=env)
+    if code != 0 and LIFETIME_ERROR in err:
+        # The allocation's time ran down since the check; not the job's fault, so no retry used.
+        task["status"] = "PENDING"
+        return
     if code != 0 or not out.strip():
         finish(cfg, task, {"result": "SUBMIT_FAILED", "rc": None, "runtime": None,
                            "note": err.strip()})
         return
     task["job"], task["status"], task["missing"] = out.split()[-1], "RUNNING", 0
+    task["mode"] = mode
     log(f"{task['name']} attempt {task['attempt']} submitted as {task['job']}")
 
 
@@ -248,15 +302,18 @@ def finish(cfg, task, job):
 
 # ---- the campaign -----------------------------------------------------------------------
 
-def drive(cfg, state, tasks):
+def drive(cfg, mode, state, tasks):
     """Submit and poll until every task has finished, retrying as needed."""
     poll_failures = 0
     while True:
-        for task in [t for t in tasks if t["status"] == "PENDING"]:
+        pending = [t for t in tasks if t["status"] == "PENDING"]
+        left = timeleft() if pending and mode == "allocation" else None
+        ready = [t for t in pending if left is None or t["time"] <= left]
+        for task in ready:
             task["attempt"] += 1  # saved first, so a crash mid-submit can't reuse a directory
             save(cfg, state)
-            submit(cfg, state, task)
-            save(cfg, state)  # record the job id at once; these jobs outlive this process
+            submit(cfg, mode, state, task)
+            save(cfg, state)  # record the job id at once
 
         running = [t for t in tasks if t["status"] == "RUNNING"]
         if running:
@@ -285,13 +342,15 @@ def drive(cfg, state, tasks):
 
         if not any(t["status"] in ("PENDING", "RUNNING") for t in tasks):
             return
+        if len(ready) < len(pending) and not any(t["status"] == "RUNNING" for t in tasks):
+            raise Pause("the next job needs more time than this allocation has left")
         time.sleep(cfg.get("poll_seconds", 60))
 
 
-def advance(cfg, state):
+def advance(cfg, mode, state):
     while True:
         cycle = state["cycles"][-1]
-        drive(cfg, state, cycle["members"])
+        drive(cfg, mode, state, cycle["members"])
         if any(t["status"] != "DONE" for t in cycle["members"]):
             return "failed", "ensemble did not fully succeed; analysis was not run"
         # The dependency: the analysis task only exists once every member is DONE.
@@ -303,7 +362,7 @@ def advance(cfg, state):
                                        for t in cycle["members"]]}, handle, indent=1)
             cycle["analysis"] = new_task(cfg, "analysis", "analysis",
                                          dict(cfg["analysis"].get("params", {})))
-        drive(cfg, state, [cycle["analysis"]])
+        drive(cfg, mode, state, [cycle["analysis"]])
         if cycle["analysis"]["status"] != "DONE":
             return "failed", "analysis did not succeed"
         directive = cycle["analysis"]["next_cycle"] or {}
@@ -316,7 +375,7 @@ def advance(cfg, state):
         save(cfg, state)
 
 
-def run(cfg):
+def run(cfg, mode="login"):
     os.makedirs(cfg["run_dir"], exist_ok=True)
     path = os.path.join(cfg["run_dir"], "state.json")
     if os.path.exists(path):
@@ -326,21 +385,28 @@ def run(cfg):
             log("already completed")
             return 0
         cycle = state["cycles"][-1]
-        for task in cycle["members"] + ([cycle["analysis"]] if cycle["analysis"] else []):
+        tasks = cycle["members"] + ([cycle["analysis"]] if cycle["analysis"] else [])
+        if mode == "allocation" and any(t["status"] == "RUNNING" and t.get("mode") == "login"
+                                        for t in tasks):
+            # An allocation can't see queue jobs, so it would wrongly resubmit them.
+            sys.exit("error: jobs submitted from the login node are still tracked; "
+                     "resume on the login node until they finish")
+        for task in tasks:
             if task["status"] in ("FAILED", "CANCELED"):
                 # Fresh budget and the current config's settings.
                 params = member_params(cfg, state) if task["kind"] == "ensemble" \
                     else dict(cfg["analysis"].get("params", {}))
                 task.update(status="PENDING", params=params, unpredicted=0, predicted={},
                             time=time_limit(cfg, task["kind"]))
-        log(f"resuming at cycle {len(state['cycles']) - 1}")
+        log(f"resuming at cycle {len(state['cycles']) - 1} in {mode} mode")
     else:
         state = {"status": "running", "message": "", "carry": {}, "cycles": []}
+        log(f"running in {mode} mode")
         new_cycle(cfg, state)
     state.update(status="running", message="")
     save(cfg, state)
     try:
-        status, message = advance(cfg, state)
+        status, message = advance(cfg, mode, state)
     except Pause as exc:
         status, message = "paused", str(exc)
     state.update(status=status, message=message)
@@ -351,13 +417,29 @@ def run(cfg):
 
 # ---- commands ---------------------------------------------------------------------------
 
+def batch_args(cfg):
+    times = plan(cfg)
+    return ["batch", "-N", str(times["nodes"]), "-t", f"{math.ceil(times['request'])}s",
+            "--exclusive", f"--job-name={cfg['name']}", *queue_args(cfg),
+            "--output=" + os.path.join(cfg["run_dir"], "driver-{{id}}.out"),
+            *cfg.get("allocation", {}).get("flux_args", []),
+            "--wrap", sys.executable, os.path.abspath(__file__), "run", cfg["config_path"]]
+
+
 def dry_run(cfg):
-    size, directory = cfg["ensemble"]["size"], "<attempt dir>"
-    print(f"{size} member job(s) per cycle, {cfg.get('cycles', 1)} cycle(s). Example commands:")
-    for kind, name in (("ensemble", "member_0"), ("analysis", "analysis")):
-        args = submit_args(cfg, kind, f"{cfg['name']}-c0-{name}-a1", directory,
-                           time_limit(cfg, kind))
-        print("flux " + " ".join(str(a) for a in args))
+    print(f"{cfg['ensemble']['size']} member job(s) per cycle, {cfg.get('cycles', 1)} cycle(s)")
+    for mode in ("login", "allocation"):
+        print(f"\n{mode} mode, example job commands:")
+        for kind, name in (("ensemble", "member_0"), ("analysis", "analysis")):
+            args = submit_args(cfg, mode, kind, f"{cfg['name']}-c0-{name}-a1", "<attempt dir>",
+                               time_limit(cfg, kind))
+            print("  flux " + " ".join(args))
+    times = plan(cfg)
+    print(f"\nbatch: {times['waves']} wave(s) per cycle, campaign {times['total'] / 60:.1f}m, "
+          f"requesting {times['nodes']} node(s) for {times['request'] / 60:.1f}m")
+    if times["request"] < times["total"]:
+        print("  note: shorter than the plan, so expect to resume in another allocation")
+    print("  flux " + " ".join(batch_args(cfg)))
     return 0
 
 
@@ -389,31 +471,32 @@ def status(cfg):
     return 0
 
 
-def inside_flux_job():
-    """True inside a flux submit job, or inside a flux batch or alloc allocation."""
-    if "FLUX_JOB_ID" in os.environ:
-        return True
-    code, out, _ = flux("getattr", "instance-level")
-    return code == 0 and out.strip() != "0"
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["run", "status"])
+    parser.add_argument("command", choices=["run", "batch", "status"])
     parser.add_argument("config")
-    parser.add_argument("--dry-run", action="store_true", help="run: only print example commands")
+    parser.add_argument("--dry-run", action="store_true", help="only print example commands")
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.command == "status":
         return status(cfg)
     if args.dry_run:
         return dry_run(cfg)
-    if "YOUR_BANK" in cfg.get("flux_args", []):
-        sys.exit("config error: replace YOUR_BANK in flux_args")
-    if inside_flux_job():
-        sys.exit("error: campaign.py must run outside Flux jobs, such as on a login node")
-    return run(cfg)
+    mode = detect_mode()
+    if mode is None:
+        sys.exit("error: start campaign.py on a login node or inside flux batch or flux alloc, "
+                 "not inside a single job")
+    if mode == "login" and cfg.get("bank") == "YOUR_BANK":
+        sys.exit("config error: set bank in the config")
+    if args.command == "batch":
+        if mode != "login":
+            sys.exit("error: run batch from a login node")
+        os.makedirs(cfg["run_dir"], exist_ok=True)
+        code, out, err = flux(*batch_args(cfg))
+        print(out.strip() or err.strip())
+        return code
+    return run(cfg, mode)
 
 
 if __name__ == "__main__":

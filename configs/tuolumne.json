@@ -3,11 +3,14 @@
   "run_dir": "../runs/sagest",
   "cycles": 3,
   "poll_seconds": 60,
-  "time": {"member": "45m", "analysis": "15m", "buffer": "15m"},
-  "flux_args": ["-q", "pbatch", "-B", "YOUR_BANK"],
+  "queue": "pbatch",
+  "bank": "YOUR_BANK",
+  "time": {"member": "45m", "analysis": "15m", "buffer": "15m", "reserve": "1h"},
+  "allocation": {"nodes": 16, "max_time": "12h"},
   "ensemble": {
     "size": 16,
-    "flux_args": ["-N1", "-n4", "-c24", "-g1", "--exclusive"],
+    "nodes": 1,
+    "flux_args": ["-n4", "-c24", "-g1", "--exclusive"],
     "command": ["python3", "{config_dir}/../examples/ensemble_member.py"],
     "params": {"dt": 0.01},
     "retries": 2,
@@ -19,7 +22,8 @@
     }
   },
   "analysis": {
-    "flux_args": ["-N1", "-c24", "--exclusive"],
+    "nodes": 1,
+    "flux_args": ["-c24", "--exclusive"],
     "command": ["python3", "{config_dir}/../examples/post_analysis.py"],
     "retries": 2
   }
